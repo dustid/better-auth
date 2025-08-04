@@ -138,7 +138,6 @@ export const bearer = (options?: BearerOptions) => {
 						} catch (e) {
 							return;
 						}
-						console.log("Bearer token found:", signedToken);
 						const existingHeaders = (c.request?.headers ||
 							c.headers) as Headers;
 						const headers = new Headers({
