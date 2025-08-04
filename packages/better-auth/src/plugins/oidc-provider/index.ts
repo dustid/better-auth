@@ -228,6 +228,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 
 	return {
 		id: "oidc",
+		options: opts,
 		hooks: {
 			after: [
 				{
