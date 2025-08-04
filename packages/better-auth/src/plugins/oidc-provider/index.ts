@@ -886,12 +886,19 @@ export const oidcProvider = (options: OIDCOptions) => {
 									getSubject: () => user.id,
 									issuer: ctx.context.options.baseURL,
 									expirationTime,
-									definePayload: async () => ({
-										...payload,
-										typ: "Bearer",
-										sid: ctx.context.session!.session.id,
-										tok: ctx.context.session!.session.token,
-									}),
+									definePayload: async () => {
+										const session = ctx.context.session;
+										const pluginPayload = session
+											? await jwtPlugin.options?.jwt?.definePayload?.(session)
+											: {};
+										return {
+											...payload,
+											...pluginPayload,
+											typ: "Bearer",
+											sid: ctx.context.session!.session.id,
+											tok: ctx.context.session!.session.token,
+										};
+									},
 								},
 							});
 						}
