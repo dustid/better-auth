@@ -3,6 +3,10 @@ import type { BetterAuthPlugin } from "../../types/plugins";
 import { parseSetCookieHeader } from "../../cookies";
 import { createAuthMiddleware } from "../../api";
 import { createHMAC } from "@better-auth/utils/hmac";
+import type { GenericEndpointContext } from "../../types";
+import type { oidcProvider } from "../oidc-provider";
+import { jwtVerify } from "jose";
+import { getJwksAdapter } from "../jwt/adapter";
 
 interface BearerOptions {
 	/**
@@ -13,6 +17,43 @@ interface BearerOptions {
 	 * @default false
 	 */
 	requireSignature?: boolean;
+}
+
+const getOidcPlugin = (ctx: GenericEndpointContext) => {
+	return ctx.context.options.plugins?.find(
+		(plugin) => plugin.id === "oidc",
+	) as ReturnType<typeof oidcProvider>;
+};
+
+const getJwks = async (ctx: GenericEndpointContext) => {
+	const adapter = getJwksAdapter(ctx.context.adapter);
+	const keySets = await adapter.getAllKeys();
+	return {
+		keys: keySets.map((keySet) => ({
+			...JSON.parse(keySet.publicKey),
+			kid: keySet.id,
+		})),
+	};
+};
+
+export async function validateToken(
+	token: string,
+	jwks: {
+		kid: string;
+		kty: string;
+		use: string;
+		n: string;
+		e: string;
+		x5c: string[];
+	}[],
+) {
+	const header = JSON.parse(atob(token.split(".")[0]));
+	const key = jwks.find((key) => key.kid === header.kid);
+	if (!key) {
+		throw new Error("Key not found");
+	}
+	const verified = await jwtVerify(token, key);
+	return verified;
 }
 
 /**
@@ -38,9 +79,41 @@ export const bearer = (options?: BearerOptions) => {
 							return;
 						}
 
+						const oidcPlugin = getOidcPlugin(c);
+
 						let signedToken = "";
 						if (token.includes(".")) {
-							signedToken = token.replace("=", "");
+							// jwt
+							if (oidcPlugin && oidcPlugin.options.accessTokenAsJWT) {
+								// If oidc plugin present, enabled, and oidc is set to using
+								// JWTs as access tokens,
+								// verify its signature
+								// decode if valid
+								// grab the token from the payload
+								// use that session token to set the cookie
+								//
+								// - may need to consider whether bearer plugin requireSignature is set to True
+								// - ideally should only have the session id in the payload but not easily queryable
+								// with internalAdapter at the moment
+								try {
+									const keys = await getJwks(c);
+									const verified = await validateToken(token, keys.keys);
+									if (!verified || !verified.payload?.tok) {
+										return;
+									}
+									signedToken = (
+										await serializeSignedCookie(
+											"",
+											verified.payload.tok as string,
+											c.context.secret,
+										)
+									).replace("=", "");
+								} catch (e) {
+									return;
+								}
+							} else {
+								signedToken = token.replace("=", "");
+							}
 						} else {
 							if (options?.requireSignature) {
 								return;
@@ -65,6 +138,7 @@ export const bearer = (options?: BearerOptions) => {
 						} catch (e) {
 							return;
 						}
+						console.log("Bearer token found:", signedToken);
 						const existingHeaders = (c.request?.headers ||
 							c.headers) as Headers;
 						const headers = new Headers({
