@@ -153,6 +153,17 @@ export interface OIDCOptions {
 	 * @default false
 	 */
 	useJWTPlugin?: boolean;
+
+	/**
+	 * Whether to return the access token as a JWT.
+	 *
+	 * This is only used if the `useJWTPlugin` option is enabled.
+	 *
+	 * If this is true, the access token will a JWT signed using the JWT plugin
+	 *
+	 * @default false
+	 */
+	accessTokenAsJWT?: boolean;
 }
 
 export interface AuthorizationQuery {
