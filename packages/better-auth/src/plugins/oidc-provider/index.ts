@@ -7,7 +7,12 @@ import {
 	getSessionFromCtx,
 	sessionMiddleware,
 } from "../../api";
-import type { BetterAuthPlugin, GenericEndpointContext } from "../../types";
+import type {
+	BetterAuthPlugin,
+	GenericEndpointContext,
+	Session,
+	User,
+} from "../../types";
 import {
 	generateRandomString,
 	symmetricDecrypt,
@@ -28,11 +33,40 @@ import { base64 } from "@better-auth/utils/base64";
 import { getJwtToken } from "../jwt/sign";
 import type { jwt } from "../jwt";
 import { defaultClientSecretHasher } from "./utils";
+import { randomUUID } from "node:crypto";
 
 const getJwtPlugin = (ctx: GenericEndpointContext) => {
 	return ctx.context.options.plugins?.find(
 		(plugin) => plugin.id === "jwt",
 	) as ReturnType<typeof jwt>;
+};
+
+const createSessionWithAccessToken = async (
+	user: User,
+	options: OIDCOptions,
+	ctx: GenericEndpointContext,
+) => {
+	const newSession: Partial<Session> = {
+		createdAt: new Date(),
+		updatedAt: new Date(),
+		token: generateRandomString(32, "a-z", "A-Z"),
+		expiresAt: new Date(Date.now() + options.accessTokenExpiresIn! * 1000),
+		userId: user.id,
+		ipAddress: ctx.request?.headers.get("x-forwarded-for") || "",
+	};
+	const session = await ctx.context.internalAdapter.createSession(
+		user.id,
+		ctx,
+		false, // remember me
+		newSession,
+		true, // override all
+	);
+	ctx.context.session = {
+		session,
+		user,
+	};
+
+	return newSession.token!;
 };
 
 /**
@@ -228,6 +262,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 
 	return {
 		id: "oidc",
+		options: opts,
 		hooks: {
 			after: [
 				{
@@ -523,7 +558,23 @@ export const oidcProvider = (options: OIDCOptions) => {
 								error: "invalid_grant",
 							});
 						}
-						const accessToken = generateRandomString(32, "a-z", "A-Z");
+						const user = await ctx.context.internalAdapter.findUserById(
+							token.userId,
+						);
+						if (!user) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "user not found",
+								error: "invalid_grant",
+							});
+						}
+						// TODO: Delete old session
+
+						// this also updates the context with the new session
+						const accessToken = await createSessionWithAccessToken(
+							user,
+							opts,
+							ctx,
+						); // generateRandomString(32, "a-z", "A-Z");
 						const newRefreshToken = generateRandomString(32, "a-z", "A-Z");
 						const accessTokenExpiresAt = new Date(
 							Date.now() + opts.accessTokenExpiresIn * 1000,
@@ -545,8 +596,34 @@ export const oidcProvider = (options: OIDCOptions) => {
 								updatedAt: new Date(),
 							},
 						});
+						let jwtToken: string | null = null;
+						if (options.useJWTPlugin && options.accessTokenAsJWT) {
+							const jwtPlugin = getJwtPlugin(ctx);
+							jwtToken = await getJwtToken(ctx, {
+								...jwtPlugin.options,
+								jwt: {
+									...jwtPlugin.options?.jwt,
+									getSubject: () => user.id,
+									issuer: ctx.context.options.baseURL,
+									expirationTime: accessTokenExpiresAt,
+									definePayload: async () => {
+										const session = ctx.context.session;
+										const pluginPayload = session
+											? await jwtPlugin.options?.jwt?.definePayload?.(session)
+											: {};
+										return {
+											...payload,
+											...pluginPayload,
+											typ: "Bearer",
+											sid: ctx.context.session!.session.id,
+											tok: ctx.context.session!.session.token,
+										};
+									},
+								},
+							});
+						}
 						return ctx.json({
-							access_token: accessToken,
+							access_token: jwtToken ? jwtToken : accessToken,
 							token_type: "bearer",
 							expires_in: opts.accessTokenExpiresIn,
 							refresh_token: newRefreshToken,
@@ -705,7 +782,24 @@ export const oidcProvider = (options: OIDCOptions) => {
 					await ctx.context.internalAdapter.deleteVerificationValue(
 						verificationValue.id,
 					);
-					const accessToken = generateRandomString(32, "a-z", "A-Z");
+					const user = await ctx.context.internalAdapter.findUserById(
+						value.userId,
+					);
+
+					if (!user) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "user not found",
+							error: "invalid_grant",
+						});
+					}
+
+					// this also updates the context with the new session
+					const accessToken = await createSessionWithAccessToken(
+						user,
+						opts,
+						ctx,
+					);
+
 					const refreshToken = generateRandomString(32, "A-Z", "a-z");
 					const accessTokenExpiresAt = new Date(
 						Date.now() + opts.accessTokenExpiresIn * 1000,
@@ -727,15 +821,6 @@ export const oidcProvider = (options: OIDCOptions) => {
 							updatedAt: new Date(),
 						},
 					});
-					const user = await ctx.context.internalAdapter.findUserById(
-						value.userId,
-					);
-					if (!user) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "user not found",
-							error: "invalid_grant",
-						});
-					}
 
 					const profile = {
 						given_name: user.name.split(" ")[0],
@@ -765,14 +850,16 @@ export const oidcProvider = (options: OIDCOptions) => {
 							? new Date(ctx.context.session.session.createdAt).getTime()
 							: undefined,
 						nonce: value.nonce,
-						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
+						acr: "urn:mace:incommon:iap:silver", // default to silver - ! this should be configurable and should be validated against the client's metadata
 						...userClaims,
 						...additionalUserClaims,
 					};
+
 					const expirationTime =
 						Math.floor(Date.now() / 1000) + opts.accessTokenExpiresIn;
 
 					let idToken: string;
+					let jwtToken: string | null = null;
 
 					// The JWT plugin is enabled, so we use the JWKS keys to sign
 					if (options.useJWTPlugin) {
@@ -786,39 +873,42 @@ export const oidcProvider = (options: OIDCOptions) => {
 								error: "internal_server_error",
 							});
 						}
-						idToken = await getJwtToken(
-							{
-								...ctx,
-								context: {
-									...ctx.context,
-									session: {
-										session: {
-											id: generateRandomString(32, "a-z", "A-Z"),
-											createdAt: new Date(),
-											updatedAt: new Date(),
-											userId: user.id,
-											expiresAt: new Date(
-												Date.now() + opts.accessTokenExpiresIn * 1000,
-											),
-											token: accessToken,
-											ipAddress: ctx.request?.headers.get("x-forwarded-for"),
-										},
-										user,
-									},
-								},
+						idToken = await getJwtToken(ctx, {
+							...jwtPlugin.options,
+							jwt: {
+								...jwtPlugin.options?.jwt,
+								getSubject: () => user.id,
+								audience: client_id.toString(),
+								issuer: ctx.context.options.baseURL,
+								expirationTime,
+								definePayload: async () => payload,
 							},
-							{
+						});
+
+						if (options.accessTokenAsJWT) {
+							jwtToken = await getJwtToken(ctx, {
 								...jwtPlugin.options,
 								jwt: {
 									...jwtPlugin.options?.jwt,
 									getSubject: () => user.id,
-									audience: client_id.toString(),
 									issuer: ctx.context.options.baseURL,
 									expirationTime,
-									definePayload: () => payload,
+									definePayload: async () => {
+										const session = ctx.context.session;
+										const pluginPayload = session
+											? await jwtPlugin.options?.jwt?.definePayload?.(session)
+											: {};
+										return {
+											...payload,
+											...pluginPayload,
+											typ: "Bearer",
+											sid: ctx.context.session!.session.id,
+											tok: ctx.context.session!.session.token,
+										};
+									},
 								},
-							},
-						);
+							});
+						}
 
 						// If the JWT token is not enabled, create a key and use it to sign
 					} else {
@@ -831,7 +921,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 
 					return ctx.json(
 						{
-							access_token: accessToken,
+							access_token: jwtToken ? jwtToken : accessToken,
 							token_type: "Bearer",
 							expires_in: opts.accessTokenExpiresIn,
 							refresh_token: requestedScopes.includes("offline_access")
